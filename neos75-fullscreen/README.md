@@ -1,0 +1,263 @@
+# AULA Neos75 全屏补丁与键盘小组件
+
+把官方自定义媒体页从右侧320×320区域扩展为 **480×360全屏**，隐藏左侧状态条。2026-11-02已在一台Neos75上刷入并逐字节回验，用户确认：**图片和GIF都全屏正常**。
+
+![全屏验收测试动画](examples/fullscreen-test.gif)
+
+上图是生成的验收素材，非屏幕实拍。实机确认见 [验收记录](evidence/user-acceptance.json)。
+
+## 下载可执行程序
+
+**v1.4.0 桌面新版**：简洁的玻璃风格界面，一个程序包含“一键全屏”和“小组件”。自动读取本机备份、匹配补丁并校验；组件可搜索添加、移除、排序、保存并自动分页。新增天气、Codex 状态、组件固定页与原厂翻页按钮。四平台下载，详见 [新版使用说明](docs/desktop-glass.md) 与 [更新内容](docs/release-v1.4.0.md)。
+
+[Windows / Mac / Linux 下载](https://github.com/hacker1232345/neos75-fullscreen/releases/latest)。程序内置运行环境；Mac 支持 macOS 15+，Linux x64 以 Ubuntu 22.04/24.04 桌面为目标。Mac/Linux USB/DFU 尚待真机验收。
+
+v1.2.0 在原有全屏补丁之上加了一层可选的**屏幕部件**：把电脑的时钟、CPU、内存、网络等状态实时画成480×360图片推到屏幕上。补丁按备份哈希自动选择，**无需勾选“无验证”**。没有原始备份时，先点“从设备读取备份”；也可选择已有备份离线识别。Issue #1构建标明“离线适配，待实机验收”。未知构建改为按内容锚点自动适配（v1.7.0 起），强制模式仍默认关闭。详见 [可执行程序说明](docs/desktop-release.md)。
+
+**六个原厂界面不等于六个独立图片槽。** 当前上传仍会替换同一个自定义媒体区；本版支持电脑端组件轮播/固定页与原厂前后翻页，没有实现图片和组件分别保存在两个原厂界面。详见 [天气、Codex 与切页说明](docs/widget-sources.md)。
+
+## 补丁链
+
+固件配置是多层叠加的，链式衔接由代码区SHA256精确决定，不做“看起来像就套用”的推断：
+
+| 层 | 配置 | 从 → 到 | 改动 | 验证状态 |
+| --- | --- | --- | --- | --- |
+| 第一层 | `firmware/fullscreen.patch.json` | 原版 `66679ff2` → 全屏 `cdd6334d` | 27 字节 | 实机验收 |
+| 第二层 | `firmware/profiles/clean.patch.json` | 全屏 `cdd6334d` → 全屏+清爽 `8465dd63` | 13 字节 | 实机刷入并逐字节回验 |
+| 第三层 | `firmware/profiles/widget.patch.json` | 全屏+清爽 `8465dd63` → 覆盖组件 `dce6dce7` | 2369 字节 | 实机刷入并逐扇区回验 |
+| 第四层 | `firmware/profiles/widget-none.patch.json` | 覆盖组件 `dce6dce7` → 默认关闭 `ec412e09` | 366 字节 | 离线通过，待实机验收 |
+| 另一条链 | `firmware/profiles/issue1.patch.json` | 原版2 `74f2fa47` → 全屏2 `9093f898` | 27 字节 | 离线通过，待实机验收 |
+
+一个「原版」备份会自动连打两层到链末；如果设备已经在第一层，程序识别为 `upgradeable` 并**只补剩余那层**。第二层只改13个字节：
+
+| 地址 | 文件偏移 | 旧 → 新 | 作用 |
+| --- | --- | --- | --- |
+| `0x3453c` | `0x2c53c` | `f2f72cf9` → `00bf00bf` | 上传开始时不再隐藏全屏图片对象，消除上传期间满屏黑 |
+| `0x345aa` | `0x2c5aa` | `09f06bff` → `00bf00bf` | 跳过进度环绘制调用 |
+| `0x345cf` | `0x2c5cf` | `f6b831` → `f2dc51` | 上传收尾阈值 3000ms → 1500ms（刷新 33s → 3~4s） |
+| `0x3e54a` | `0x3654a` | `ff` → `00` | 覆盖层容器初始化即隐藏 |
+| `0x3e69c` | `0x3669c` | `30` → `00` | 覆盖层标签初值串 `"0%\n"` 清空 |
+
+第二层触及的两个4KB扇区是 `0x34000`、`0x3e000`。
+
+第三层（任意页覆盖组件）**不碰页表，也不碰原厂任何一个页面的处理函数**（`page_table_untouched` / `vendor_enter_untouched` 由构建器断言）。它只做三件事：把命令表 `0x35316` 的 2 字节改指自己的接收器、往代码区空闲带 `0x4aacc` 放一段代码、把默认页掩码写进数据区。触及 `0x35000`、`0x4a000`、`0x4b000` 三个扇区。
+
+## 任意页覆盖组件（文字直写）
+
+`dashboard/` 那条路是把画面渲染成 JPEG 走官方上传通道；这条路是把**四行文字直接写进键盘内存**——不擦 Flash、不进 DFU、不占用上传队列，所以刷新能压到两三秒一次。
+
+```sh
+node tools/push_widget.js probe                  # 只读：当前页有没有装好组件
+node tools/push_widget.js mask 1,2,3,4,5,6       # 哪些页面显示文字（写 RAM）
+node tools/push_widget.js mask 0                 # 0 = 全部关闭，四个字立刻消失，界面恢复原厂
+node tools/push_widget.js rows "CPU 40%|RAM 85%|BAT 78%|22:30:32"
+node tools/push_widget.js loop                   # 常驻，从 stdin 逐行读 {"rows":[...]}
+python dashboard/native_rows.py --list           # 哪些部件能写成文字
+```
+
+- 每屏独立缓冲：六个页面可以各自显示不同内容。
+- 未选中的页面保持官方原样，图片和 GIF 不受影响。
+- 只支持 ASCII `0x20`–`0x7e`；中文会被替换成空格。四行、每行最多 47 字符。
+- 应答 `FE` 接受 / `FD` 该页尚未初始化（翻过去就好）/ `FC` 无效帧。
+- 取不到的传感器写 `n/a`，不编造数字。
+- **默认一页都不开**：装上组件后页掩码是 `0`，六页全是原厂画面；要用哪一页自己勾。桌面程序里「关闭文字组件」= 把页选择清空再应用，本质就是写掩码 `0`（真机实测回 `FE`，随后 `probe` 变 `FD`）。
+- 没被选中的页面在固件里会被**主动清空**（`TICK` 段的 `tk_clear` 分支把四个 label 指到空串），所以不会出现「关掉了但旧字还挂在屏上」。
+
+## 屏幕部件（可选显示）
+
+`dashboard/` 把电脑状态画成 480×360 baseline JPEG 推到屏幕上。21 个可选部件：
+
+| 分组 | 部件 |
+| --- | --- |
+| 时间 | `clock_big` 超大时钟、`date` 日期、`calendar` 今天几号 + 第几周 |
+| 性能 | `cpu`、`mem`、`gpu`、`temp` 温度、`history_cpu` 折线、`top_proc` 最占进程 |
+| 存储 | `disk` 磁盘剩余 |
+| 网络 | `net` 上下行速率、`net_pulse` 网速条、`link` 连接方式 + 延迟 + 丢包、`ip` 地址 |
+| 系统 | `host` 主机名、`uptime` 运行时长 |
+| 电源 | `battery` 电池、`volume` 音量 |
+| 生活 / 工作 | `weather` 天气、`codex` Codex 状态、`playing` 正在播放 |
+
+预设：`minimal` / `default` / `full` / `performance` / `network` / `desk` / `media`，也可以任意勾选组合。
+
+`desk` 是给「一直挂在屏幕上」用的：时间 + 正在播放 + 日历 + CPU/内存 + 连接 + 网速条 + 电池，
+八个组件一屏看完。`media` 是听歌时用的，歌名占半屏。
+
+「正在播放」读的是 Windows 的 SMTC（`dashboard/media_state.ps1`，每 2 秒一行 JSON）。
+它固定用 `powershell.exe`（5.1）：`Windows.Media.Control` 是 WinRT 组件，PowerShell 7 没有
+WinRT 投影，类型根本不存在。只覆盖走 SMTC 的播放器，独占 WASAPI 的程序看不到。
+
+「连接」的延迟测的是 `223.5.5.5`。这台机器可能挂着代理 TUN，网关 `198.18.x.x` 恒 0–1 ms，
+测出来没有意义；公网不通时才退回网关，至少还能看出链路断没断。拿不到延时一律写 `n/a`，
+不拿 0 冒充。
+
+## 两个旋钮，六个动作
+
+键盘上方的两个旋钮出厂是「音量」「翻页」，两个旋钮还能按下去。这六个动作位现在都能改成
+别的键——上一曲、下一曲、静音、亮度、计算器、主页等等，改完立刻生效，不需要装驱动，
+也不依赖官方软件。
+
+```sh
+python tools/knob_config.py --list                      # 列出 27 个可选动作
+python tools/knob_config.py --fw keyboard.bin --out new.bin        --vol-cw next --vol-ccw prev --vol-press mute        --scr-cw page --scr-ccw page --scr-press calc     # 只生成，不写盘
+node   tools/knob_flash.js read   --fw new.bin           # 反解一份固件当前是什么配置
+node   tools/knob_flash.js flash  --target new.bin --yes # 备份→擦除→写入→回验→固化
+```
+
+桌面程序里有一整块「两个旋钮，六个动作」面板：六个下拉框选动作，`预览改动` 只生成不写盘，
+`写入键盘` 才会真的擦写。写入前自动整片备份，写完逐字节回验，不一致就不固化。
+
+六个动作位分别是：音量旋钮顺时针 / 逆时针 / 按下，屏幕旋钮顺时针 / 逆时针 / 按下。
+
+- 前四个位（音量三格 + 屏幕旋钮按下）改的是固件里那张「动作号 → HID 码」的 tbb 表，**两份副本必须同时改**，
+  只改一份不生效——固件里有两份一模一样的表，真正被调用的是前面那份。
+- 屏幕旋钮的左右旋转**不发 HID 码**，它在固件里直接给屏幕发 A5 帧翻页。要改它得覆盖那两段代码，
+  覆盖后必须跳回原函数出口 `0x080117BE`，中途自己 `pop` 会破坏栈、键盘重启。
+- 「翻页」只有一个选项。原厂那段代码自带方向判断，同一份字节放到顺时针位就是下一屏、
+  放到逆时针位就是上一屏——拆成「下一屏/上一屏」两个选项是假的。
+
+### 四套配色（对应官方四种颜色）
+
+官方这台键盘有四种颜色：Venus 银 / Selene 灰 / Hades 黑 / Athena 白。渲染器把这四种都做成了主题，
+配色只是一套色板，布局与部件完全不变——换主题不会改变任何信息的排布。
+
+```sh
+python dashboard/render.py --in state.json --out a.jpg --theme hades    # 黑，原版深色
+python dashboard/render.py --in state.json --out b.jpg --theme selene   # 灰，石墨底 + 月光银蓝
+python dashboard/render.py --in state.json --out c.jpg --theme venus    # 银，银白底 + 香槟铜
+python dashboard/render.py --in state.json --out d.jpg --theme athena   # 白，象牙底 + 墨字柔金
+```
+
+桌面程序里在「屏幕预览」上方有一排配色按钮，点一下立刻重画预览，选中的配色会写进 `settings.json`，
+下次打开还是它。旧配置没有这一项时自动退回 Hades 黑，不会因为少了字段打不开。
+
+主题表的键名是固定的（`BG / CARD / CARD_HI / TRACK / LINE / TXT / DIM / FAINT / ACCENT / GOOD / WARN / BAD / NA / TOPLINE / WATERMARK`），
+新增配色只要往 `THEMES` 里加一条，绘制代码一行都不用动。
+
+```sh
+python dashboard/render.py --list                    # 列出部件注册表
+node   dashboard/push.js info                        # 只读查询屏幕
+node   dashboard/push.js dry --preset full           # 离线构造传输计划，不打开USB
+node   dashboard/push.js once  --widgets clock_big,cpu,mem,net
+node   dashboard/push.js loop  --preset default --interval 3000
+```
+
+采样走 `dashboard/live_state.ps1`（全 CIM，稳态约 0.62 秒/次，重项按相位分摊缓存）。渲染走 `dashboard/render.py`（Pillow，`progressive=False`，超字节上限时二分降质量）。推送走 `dashboard/push.js`，协议与 `wallpaper/screen_wallpaper.js` 一致。
+
+## 日常使用
+
+已经刷入本补丁的设备，重新连接官方程序后，在第5页导入原图片或GIF即可。旧320×320转换素材需重新导入。非480×360原图的缩放/裁切由官方程序控制。
+
+要显示电脑状态，有两种方式：
+
+1. **图片方式**：桌面程序的「屏幕部件」页，或直接跑上面的 `push.js`。同一时刻只能有一个上传者，连续推送前请关闭官方程序的上传任务。
+2. **文字方式**：桌面程序「小组件」页底部的「直接写进键盘内存的四行文字」面板。不需要关闭官方程序，也不影响已有的图片和 GIF。
+
+## 内容
+
+- `firmware/fullscreen.patch.json`：第一层补丁；精确旧/新字节、地址、原始和目标SHA256；仅改变27个载荷字节。
+- `firmware/profiles/clean.patch.json`：第二层补丁（全屏+清爽），挂在第一层之上，只改13字节。
+- `firmware/profiles/issue1.patch.json`：Issue #1构建重新定位后的补丁；以精确代码哈希自动选择，同样只改27字节。
+- `tools/build_fullscreen.py`：纯Python标准库生成器；按哈希识别镜像所处层，自动连打剩余层，并保留自己的末尾4KB数据。
+- `tools/mcu_dfu.js`、`mcu_flash_live.js`：MCU DFU传输及带备份/回验的本机专用刷写工具。
+- `wallpaper/`：官方壁纸协议的JPEG上传工具和差分测试。GIF全屏由补丁支持，日常GIF导入使用官方程序；本JPEG工具不提供通用GIF转换。
+- `dashboard/`：屏幕部件模块（采样、渲染、推送、离线自测）；`dashboard/native_rows.py` 把采样状态折成四行 ASCII。
+- `tools/native_widget.js`、`tools/push_widget.js`：原生文字通道（协议编解码、命令行、常驻 loop）。
+- `tools/build_widget.py`：覆盖组件固件的构建器；纯标准库，自带 THUMB-2 长跳编码器。
+- `tools/symbols.py`、`tools/make_anchor.py`、`tools/adapt_firmware.py`、`tools/adapt_issue.py`：陌生固件的自动适配（符号签名、内容锚点、链式定位、issue 入口）。
+- `firmware/anchors/`：每层补丁的内容锚点与厂商函数签名，由上面两个脚本生成。
+- `examples/`：480×360边框图和两帧GIF。
+- `evidence/`、`docs/`：实机回验、仿真结果、验收及纠错复盘。
+
+完整设备备份、原厂固件和生成后的整片镜像由设备持有人本地保存。本仓库发布补丁数据及工具，不包含个人设备完整Flash转储。
+
+## 适配范围
+
+目前自动识别以下两种已知构建，以前487424字节SHA256匹配，不按后台版本号或VID/PID选择：
+
+| 构建 | 原版代码前缀SHA256 | 验证状态 |
+| --- | --- | --- |
+| 原验证构建 | `66679ff2cb06ab5a5e47673f679e14e68bf2082fb6401b3808ca58d7f2e1a40c` | 图片/GIF已实机验收；清爽层已实机刷入回验 |
+| Issue #1构建 | `74f2fa47a76206526ade19dc66c398fa18dbfecf779c008b4470cf63706a726b` | 离线定位、ARM仿真、刷写模型通过；待实机验收 |
+
+已补丁的中间态代码（全屏 `cdd6334d`）与链末代码（全屏+清爽 `8465dd63`）也会自动识别：前者报“可继续升级”，后者报“已是链末”，都不需要重复刷写。原验证构建参考备份的完整SHA256为：
+
+```
+c69c38b02841c533db44e8b058a6b86d4a0e816d2bb6ce95cd2b1d5d6927016d
+```
+
+备份长度491520字节，映射0x8000..0x80000。程序严格核对前487424字节代码区域SHA256与全部补丁原字节，末尾4096字节现场数据保持原样。整片哈希因现场数据不同可能变化。其他代码构建必须重新定位，不能仅凭型号相同套用。
+
+## 别人家的固件自动适配
+
+上面的表只认已经验证过的两种构建。同款键盘出厂版本五花八门，遇到没见过的固件时，用适配器按**内容锚点**定位补丁点——不记「打在 0x2c53c 这一格」，改记「打在**这段字节**所在的那一格」，布局整体迁移也找得回来：
+
+```sh
+python tools/adapt_firmware.py --firmware backup.bin              # 只看结论
+python tools/adapt_firmware.py --firmware backup.bin --build out.bin   # 直接出可刷镜像
+python tools/adapt_firmware.py --firmware backup.bin --emit out/      # 写派生 profile
+python tools/adapt_firmware.py --selftest                          # 离线自检
+```
+
+命令行之外还有个不用装任何东西的路子：在 issue 里把备份拖进去、打 `firmware-adapt` 标签，`.github/workflows/adapt.yml` 会自动算完并回帖给出镜像下载。整条链路不接设备、不刷写，只算字节。
+
+注入层（覆盖组件那段新代码）不能按字节搬——里面含厂商函数的绝对地址，换固件必须按 16 字节入口签名重新找出那 11 个函数再重新汇编；签名对不上就只跳过这一层，前两层照打，不硬来。原理、铁律和风险清单见 [docs/adapt-any-firmware.md](docs/adapt-any-firmware.md)。
+
+**桌面程序走的是同一条路**（v1.7.0 起）：备份完发现哈希不认识，不再报「设备固件不匹配」，而是直接按锚点现算、逐层推进、重新汇编，刷写端改成核对产物本身（SHA256 + 尾部现场数据 + 向量表 + 扇区白名单，`--expect`）。真的套不上时，界面上写的是「签名对不上」「布局差得远」这种人话，而不是一句「操作已停止」。
+**擦除前会先看清「去进度条」那一层到底套上没有**：套上了才说进度条会被去掉，漏了就说进度条会保留，刷完的标题也会写「补丁已完成（进度条仍在）」。这一点比「适配成功」四个字重要——进度条留着，等于这次白刷。
+
+## 安装与离线验证
+
+### 无验证，直接打补丁（v1.1.2）
+
+在“设备与补丁”或“固件维护”页勾选同名选项；两页共用当前选择，重启后默认关闭。勾选后跳过版本哈希检查，但**仍然逐条核对补丁的旧字节**：从链首开始，一层能套就继续下一层，任一条旧字节对不上就停在该层之前，并在多条链里取能套最多的那条。
+
+- 已知构建强制 → 和正常路径一样能套完整条链（含去掉进度条的第二层）。
+- 布局迁移过的未知构建 → 套到对不上的那一层为止。比如整片都迁移了，就一层都套不上，此时输出等于原样（0 字节改动）。
+- **一层都对不上时只套最基础的一层**：`forceBlind=true`，那一层只负责全屏媒体区，不含去掉进度条的补丁 —— 程序会在擦除前就告诉你「进度条不会被去掉」，完成提示也会写「补丁已完成（进度条仍在）」，不会假装成功。
+- 尾部 4096 字节现场数据（用户配置区）在强制模式下同样受保护，不再是「强制就能改」。
+
+此模式仍不代表已经适配或能正常启动。哈希不认识的固件其实已经不需要它——v1.7.0 起桌面程序会先自动适配，只有适配器明确说套不上时才轮到这个开关。
+
+仍要求完整491520字节备份，保留补丁记录以外的字节、前256字节和最后4096字节。生成目标必须与当前备份按同一模式重建的结果完全一致，刷写只处理四个8KB保护组中的差异组，保留现场扇区检查、写后回验和恢复。输出不能覆盖原始备份。
+
+命令行生成：`python desktop/app.py --build 原始备份.bin --out 全屏固件.bin --force`。随后维护也须传入同一 `--force`，如 `python desktop/app.py --maintain flash --baseline 原始备份.bin --target 全屏固件.bin --force --yes`。不带 `--force` 的行为保持严格验证。纯Python生成器也支持 `--force`。
+
+需要Node.js及Python 3。无需接设备即可运行默认测试：
+
+```sh
+npm install
+npm test
+python -m unittest discover -s tests -v
+```
+
+用程序读取并确认代码版本匹配的原始备份生成目标（这一步不连接设备）：
+
+```sh
+python tools/build_fullscreen.py --source /path/to/mcu-before-fullscreen.bin --out /path/to/mcu-fullscreen-live-v1.bin
+```
+
+输出491536字节（含16字节DFU后缀），参考备份对应的目标SHA256：
+
+```
+3c922e809dcfac1c35ad8f1f8caebcfc999bf6475a3e6fa22fd18c5d85a4f6e5
+```
+
+若末尾现场数据与参考备份不同，生成目标的完整SHA256也会不同；以本机生成结果和代码区域校验为准，刷写前会逐字节重建比对，确保末尾数据来自本机备份。
+
+需运行固件模型测试时，把匹配备份放仓库根目录并以默认输出路径生成，再执行 `npm run test:device-image`；这些文件已加入gitignore。ARM指令仿真额外需要 `pip install -r requirements-dev.txt`，然后执行 `python tools/test_arm_emulation.py`。仿真不覆盖LCD、硬件JPEG和真实堆。
+
+## 刷写和恢复
+
+刷写会修改设备固件。请先阅读 [维护说明](docs/maintenance.md)。本工具按上述两种已知构建选择补丁，不能作为任意Neos75的一键通用升级器。`plan`和`verify`也可能使设备进入DFU，日常只查询屏幕可用 `node wallpaper/screen_wallpaper.js status`。
+
+已验证的写法是每个4096B块独立SET_ADDRESS并以DNLOAD block=2写入。4个8KB保护组为0x10000、0x32000、0x36000、0x42000，包含邻居数据，每组写后回验，最终再次回验。不能套用旧UI连续块算法。
+
+## 验证与限制
+
+实机四组回验PASS，退出DFU后应用回报480×360；静态JPEG和2帧动画传输完成，用户确认两种均全屏正常。长GIF帧率、复杂素材及断电保留尚未验收。LVGL堆384KB，全屏共享缓冲约337.5KB，剩余空间需关注。
+
+复盘与五列风险表见 [项目复盘](docs/retrospective.md)。屏幕部件走的是官方媒体页的JPEG通道，不需要无线协议；温度一类取不到的值显示 n/a，不做假数据。
+
+## 来源与许可
+
+原创补丁工具和文档采用MIT许可；品牌、原厂固件及官方前端方法的权利属于原权利人。官方方法摘录仅用于协议差分验证，详见 [第三方说明](THIRD_PARTY_NOTICES.md)。本项目与AULA官方无隶属关系。

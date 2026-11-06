@@ -1,0 +1,34 @@
+# ---- 安装包与本地大文件（绝不入库） ----
+tools/
+backup/
+
+# ---- 固件镜像与设备 flash 回读（AULA 版权 + 个人设备状态，只发补丁脚本不发镜像） ----
+*.bin
+*.rollback.json
+
+# ---- 日志（按键诊断日志 keys.log 等） ----
+*.log
+# 上游仓库自带的刷机回验日志无隐私，保留
+!neos75-fullscreen/evidence/*.log
+
+# ---- Python ----
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ---- Node ----
+node_modules/
+
+# ---- 本地工具状态与私人内容 ----
+.zcode/
+# 发布检查单含个人身份信息（git 身份、本机路径），仅本机使用
+docs/RELEASE_CHECKLIST.md
+# preview/ 含真实会话标题等隐私截图；公开用截图已遴选进 docs/screens/
+Neos75Lyrics-/preview/
+# 发布时迁移出的旧 git 历史（含个人身份 reflog）
+workspace/git-history-backup/
+
+# ---- 密钥/环境 ----
+.env
+.env.*

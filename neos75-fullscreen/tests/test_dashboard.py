@@ -1,0 +1,594 @@
+from pathlib import Path
+import contextlib
+import io
+import importlib.util
+import json
+import re
+import sys
+import tempfile
+import unittest
+import unittest.mock
+
+ROOT=Path(__file__).resolve().parents[1]
+DASH=ROOT/'dashboard'
+spec=importlib.util.spec_from_file_location('dash_render',DASH/'render.py')
+rd=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(rd)
+
+W,H=480,360
+
+STATE={'clock':'14:23:07','date':'2026-11-03','uptime':'3d 04:12','cpu_load':37.5,'cpu_freq_ghz':4.21,
+ 'mem_pct':61.2,'mem_used_gb':19.6,'mem_total_gb':32.0,'temp_c':58.0,'gpu_pct':12,'disk_free_gb':412.7,
+ 'net_down_mbps':3.21,'net_up_mbps':0.44,'bat_pct':82.0,'bat_charging':True,'bat_ac':True,'vol_pct':45,
+ 'top_proc':'chrome.exe','top_proc_pct':12.3,'ip':'192.168.1.42','host':'DESKTOP-NEOS75'}
+
+REQUIRED_FIELDS=['id','label','desc','group','default','minWidth','minHeight','draw']
+REQUIRED_IDS=['clock_big','date','cpu','mem','gpu','temp','disk','net','battery','uptime',
+ 'history_cpu','top_proc','volume','host','ip']
+PRESET_NAMES=['default','minimal','full','performance','network']
+
+
+def sof(jpeg):
+    """walk JPEG 段，返回 (marker, precision, width, height)。
+
+    SOF 段布局：FF <m> <len:2> <precision:1> <height:2> <width:2> —— 高度在前、宽度在后。
+    首段必须是 0xC0 才是 baseline（0xC2 是 progressive，设备不接受）。
+    """
+    assert jpeg[:2]==b'\xff\xd8', '不是 JPEG（缺 SOI）'
+    assert jpeg[-2:]==b'\xff\xd9', '不是 JPEG（缺 EOI）'
+    p=2; first=None
+    while p<len(jpeg):
+        assert jpeg[p]==0xFF, 'JPEG 标记损坏 @%d'%p
+        p+=1
+        while jpeg[p]==0xFF:p+=1
+        m=jpeg[p];p+=1
+        if m==0xD9:break
+        if m==0xDA:break
+        n=int.from_bytes(jpeg[p:p+2],'big')
+        if m in (0xC0,0xC1,0xC2):
+            info=(m,jpeg[p+2],int.from_bytes(jpeg[p+5:p+7],'big'),int.from_bytes(jpeg[p+3:p+5],'big'))
+            if first is None:first=info
+        p+=n
+    assert first is not None, 'JPEG 里找不到 SOF 段'
+    return first
+
+
+def main_args(argv, stdin=None):
+    """跑 render.main()，返回 (exit_code, stdout, stderr)。"""
+    out,err=io.StringIO(),io.StringIO()
+    if stdin is not None:
+        import sys
+        old=sys.stdin
+        sys.stdin=io.StringIO(stdin)
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code=rd.main(argv)
+    finally:
+        if stdin is not None:
+            sys.stdin=old
+    return code,out.getvalue(),err.getvalue()
+
+
+class Registry(unittest.TestCase):
+    def setUp(self):
+        self.raw=json.loads((DASH/'widgets.json').read_text(encoding='utf-8'))
+
+    def test_top_level_is_array_with_unique_complete_entries(self):
+        self.assertIsInstance(self.raw,list)
+        self.assertGreaterEqual(len(self.raw),15)
+        ids=[w['id'] for w in self.raw]
+        self.assertEqual(len(set(ids)),len(ids),'id 有重复: %s'%ids)
+        for w in self.raw:
+            for f in REQUIRED_FIELDS:
+                self.assertIn(f,w,'部件 %s 缺字段 %s'%(w.get('id'),f))
+            self.assertIsInstance(w['default'],bool)
+            self.assertIsInstance(w['minWidth'],int)
+            self.assertIsInstance(w['minHeight'],int)
+            self.assertGreater(w['minWidth'],0)
+            self.assertGreater(w['minHeight'],0)
+            self.assertTrue(re.match(r'^draw_[a-z0-9_]+$',w['draw']),'draw 名不符: %s'%w['draw'])
+            self.assertTrue(w['label'] and w['desc'] and w['group'],'%s 的空文本字段'%w['id'])
+
+    def test_required_ids_and_groups_present(self):
+        ids={w['id'] for w in self.raw}
+        for r in REQUIRED_IDS:self.assertIn(r,ids,'缺必需部件 %s'%r)
+        groups={w['group'] for w in self.raw}
+        for g in ['时间','性能','网络','存储','电源','系统']:
+            self.assertIn(g,groups,'缺分组 %s'%g)
+
+    def test_every_widget_is_implemented_in_render_py(self):
+        code,out,err=main_args(['--list'])
+        self.assertEqual(code,0)
+        reg=json.loads(out)
+        impl={w['id']:w for w in reg['widgets']}
+        self.assertEqual(len(reg['widgets']),len(self.raw))
+        for w in self.raw:
+            self.assertIn(w['id'],impl,'render.py 未注册 %s'%w['id'])
+            self.assertTrue(impl[w['id']]['implemented'],'%s 的 draw 函数未实现'%w['id'])
+            self.assertEqual(impl[w['id']]['draw'],w['draw'])
+        self.assertIn(rd.REGISTRY[0]['draw'],rd.DRAW_FNS)
+        for w in self.raw:self.assertIn(w['draw'],rd.DRAW_FNS)
+
+    def test_list_and_layout_cli_need_no_in_out(self):
+        for flag,key in [('--list','widgets'),('--layout','boxes')]:
+            code,out,err=main_args([flag])
+            self.assertEqual(code,0,'%s 应不需要 --in/--out'%flag)
+            self.assertIn(key,json.loads(out))
+
+    def test_presets_exist_and_are_registered(self):
+        for p in PRESET_NAMES:self.assertIn(p,rd.PRESETS)
+        for name,ids in rd.PRESETS.items():
+            for i in ids:
+                self.assertIn(i,rd.WMAP,'预设 %s 引用了未注册 id %s'%(name,i))
+
+
+class RenderOutput(unittest.TestCase):
+    def _render(self,state=None,widgets=None,preset='default',quality=72,limit=None,history=None):
+        return rd.render(dict(STATE) if state is None else state,widgets,preset,quality,limit,history)
+
+    def test_synthetic_state_gives_baseline_480x360(self):
+        data,img=self._render()
+        marker,prec,w,h=sof(data)
+        self.assertEqual((w,h),(W,H))
+        self.assertEqual(prec,8)
+        self.assertEqual(marker,0xC0,'SOF 标记 0x%02X 不是 baseline 0xC0'%marker)
+        self.assertNotEqual(marker,0xC2,'progressive 不被设备支持')
+        self.assertEqual(img.size,(W,H))
+
+    def test_every_preset_gives_correct_size_and_baseline(self):
+        for p in PRESET_NAMES:
+            with self.subTest(preset=p):
+                data,img=self._render(preset=p)
+                marker,prec,w,h=sof(data)
+                self.assertEqual((w,h),(W,H))
+                self.assertEqual((marker,prec),(0xC0,8))
+                self.assertEqual(img.size,(W,H))
+                self.assertLess(len(data),30000,'预设 %s 超出 30000 B'%p)
+
+    def test_every_widget_renders_alone(self):
+        for w in REQUIRED_IDS:
+            with self.subTest(widget=w):
+                data,_=self._render(widgets=[w])
+                marker,prec,wd,ht=sof(data)
+                self.assertEqual((wd,ht,marker,prec),(W,H,0xC0,8))
+
+    def test_unknown_widget_is_rejected_with_nonzero_exit(self):
+        for bad in ['nosuch','cpu,nosuch','CPU']:
+            with self.subTest(widgets=bad):
+                with self.assertRaises(rd.UnknownWidget):rd.layout(['cpu',bad])
+                with tempfile.TemporaryDirectory() as t:
+                    out=Path(t)/'o.jpg'
+                    code,_,err=main_args(['--in','-','--out',str(out),'--widgets',bad],json.dumps(STATE))
+                    self.assertNotEqual(code,0,'未注册 id %r 应非 0 退出'%bad)
+                    self.assertIn('未注册的部件 id',err)
+                    self.assertFalse(out.exists(),'拒绝时不应写出文件')
+        # 空串/纯空白不是合法 id；resolve 会剔除它们，剥完为空则退回预设
+        with self.assertRaises(rd.UnknownWidget):rd.layout(['cpu',''])
+        self.assertEqual(rd.resolve_widgets(['cpu,',''],'minimal'),['cpu,'])
+
+    def test_case_sensitive_ids(self):
+        self.assertRaises(rd.UnknownWidget,rd.layout,['CPU'])
+        self.assertRaises(rd.UnknownWidget,rd.layout,['Clock_Big'])
+
+    def test_unknown_preset_is_rejected(self):
+        with self.assertRaises(ValueError):rd.resolve_widgets(None,'nosuch')
+        with self.assertRaises(rd.UnknownWidget):rd.layout(['cpu','definitely_not_a_widget'])
+
+    def test_missing_or_null_fields_do_not_crash(self):
+        cases=[{}, {k:None for k in STATE}, {'cpu_load':3},
+               {'clock':12345,'cpu_load':'abc','bat_charging':'yes','uptime':[],'gpu_pct':{},'mem_pct':float('nan')},
+               {'host':'X'*500,'top_proc':'Y'*500,'ip':'1.2.3.4'*50},
+               {'cpu_load':9999,'mem_pct':-50,'bat_pct':12345,'gpu_pct':10**9,'temp_c':-999}]
+        for i,st in enumerate(cases):
+            with self.subTest(case=i):
+                data,img=self._render(state=st,preset='full')
+                self.assertEqual(sof(data)[2:],(W,H))
+                self.assertEqual(img.size,(W,H))
+
+    def test_empty_and_nondict_state_via_cli(self):
+        with tempfile.TemporaryDirectory() as t:
+            for raw in ['{}','[]','null','{"cpu_load":null}']:
+                out=Path(t)/'o.jpg'
+                code,_,err=main_args(['--in','-','--out',str(out),'--preset','full'],raw)
+                self.assertEqual(code,0,'state %s 应能正常出图: %s'%(raw,err))
+                self.assertEqual(sof(out.read_bytes())[2:],(W,H))
+
+    def test_bad_json_exits_2_without_partial_file(self):
+        with tempfile.TemporaryDirectory() as t:
+            out=Path(t)/'never.jpg'
+            code,_,err=main_args(['--in','-','--out',str(out)],'{not json')
+            self.assertEqual(code,2)
+            self.assertIn('JSON 解析失败',err)
+            self.assertFalse(out.exists())
+
+    def test_limit_triggers_quality_bisect(self):
+        big,_=self._render(preset='default',quality=72)
+        self.assertGreater(len(big),12000)
+        small,_=self._render(preset='default',quality=72,limit=12000)
+        self.assertLessEqual(len(small),12000,'--limit 未生效: %d B'%len(small))
+        self.assertEqual(sof(small)[2:],(W,H))
+        # 降质量后应仍能被设备接受（baseline + 8 位）
+        self.assertEqual(sof(small)[0],0xC0)
+
+    def test_n_a_placeholder_drawn_for_missing_values(self):
+        img=rd.render({},None,'minimal')[1]
+        colors=img.getcolors(maxcolors=1<<24)
+        self.assertTrue(colors,'空 state 渲染出全空图')
+        self.assertGreater(len(colors),5,'空 state 的配色过于单薄，n/a 占位可能没画')
+
+    def test_chinese_text_forces_cjk_capable_font(self):
+        f_cjk=rd.F(20,'mono',text='中文')
+        f_latin=rd.F(20,'mono',text='ABCDEF')
+        self.assertIsNotNone(f_cjk)
+        self.assertIsNotNone(f_latin)
+        if not Path(rd.FONT_REG).exists():
+            self.skipTest('本机没有可用汉字字体，无法验证回退（不视为失败）')
+        self.assertEqual(f_cjk.path,rd.FONT_REG,'含汉字时必须走支持汉字的字体，否则渲染成方块')
+        if rd.FONT_MONO!=rd.FONT_REG:
+            self.assertNotEqual(f_latin.path,f_cjk.path,'纯 ASCII 走等宽字体，不必占用汉字字体')
+
+    def test_fonts_resolve_per_platform(self):
+        """字体不能写死 Windows 路径，否则 macOS/Linux 上中文全成方块。"""
+        for kind,path in [('reg',rd.FONT_REG),('bd',rd.FONT_BD),('mono',rd.FONT_MONO)]:
+            self.assertTrue(path,'%s 字体候选全空'%kind)
+            if sys.platform!='win32':
+                self.assertNotIn('C:\\\\Windows',path,'非 Windows 平台不应选中 Windows 字体路径')
+
+
+class Layout(unittest.TestCase):
+    def test_layout_never_leaves_canvas(self):
+        cases=[list(rd.PRESETS[p]) for p in PRESET_NAMES]
+        cases.append(list(rd.WMAP))
+        cases.append(['clock_big'])
+        for ids in cases:
+            with self.subTest(n=len(ids)):
+                boxes,info=rd.layout(ids)
+                self.assertFalse(info['overflow'],'布局越界: %s'%info)
+                self.assertEqual(len(boxes),len(ids))
+                self.assertEqual([b['id'] for b in boxes],ids)
+                for b in boxes:
+                    self.assertGreaterEqual(b['x'],0);self.assertGreaterEqual(b['y'],0)
+                    self.assertLessEqual(b['x']+b['w'],W,'%s 右越界'%b['id'])
+                    self.assertLessEqual(b['y']+b['h'],H,'%s 下越界'%b['id'])
+                    self.assertGreater(b['w'],0);self.assertGreater(b['h'],0)
+
+    def test_boxes_do_not_overlap(self):
+        for ids in [list(rd.PRESETS[p]) for p in PRESET_NAMES]+[list(rd.WMAP)]:
+            boxes,_=rd.layout(ids)
+            for i in range(len(boxes)):
+                for j in range(i+1,len(boxes)):
+                    a,b=boxes[i],boxes[j]
+                    overlap = (a['x']<b['x']+b['w'] and b['x']<a['x']+a['w']
+                               and a['y']<b['y']+b['h'] and b['y']<a['y']+a['h'])
+                    self.assertFalse(overlap,'%s 与 %s 重叠'%(a['id'],b['id']))
+
+    def test_every_widget_alone_stays_inside(self):
+        for wid in rd.WMAP:
+            boxes,info=rd.layout([wid])
+            self.assertFalse(info['overflow'])
+            b=boxes[0]
+            self.assertLessEqual(b['x']+b['w'],W)
+            self.assertLessEqual(b['y']+b['h'],H)
+
+    def test_widgets_option_wins_over_preset(self):
+        self.assertEqual(rd.resolve_widgets(['cpu','mem'],'full'),['cpu','mem'])
+        self.assertEqual(rd.resolve_widgets(None,'minimal'),list(rd.PRESETS['minimal']))
+        self.assertEqual(rd.resolve_widgets(['cpu,','','  '],'full'),['cpu,'])
+
+
+class History(unittest.TestCase):
+    def test_append_creates_dir_and_trims_to_sixty(self):
+        with tempfile.TemporaryDirectory() as t:
+            d=Path(t)/'deep'/'state'
+            self.assertFalse(d.exists())
+            for i in range(65):
+                hist=rd.append_history(str(d),{'clock':'%02d:00:00'%(i%24),'cpu_load':float(i),'mem_pct':50.0})
+            self.assertTrue((d/'history.json').exists(),'state-dir 未自动创建')
+            self.assertEqual(len(hist),60)
+            self.assertEqual(hist[-1]['cpu'],64.0)
+            self.assertEqual(hist[0]['cpu'],5.0)
+            again=rd.load_history(str(d))
+            self.assertEqual(again,hist)
+
+    def test_broken_history_file_is_tolerated(self):
+        with tempfile.TemporaryDirectory() as t:
+            (Path(t)/'history.json').write_text('{not json',encoding='utf-8')
+            self.assertEqual(rd.load_history(t),[])
+            h=rd.append_history(t,{'clock':'01:00:00','cpu_load':1.0,'mem_pct':2.0})
+            self.assertEqual(len(h),1)
+            self.assertEqual(rd.load_history(None),[])
+            self.assertEqual(rd.append_history(None,{}),[])
+
+    def test_history_cpu_draws_with_history_from_state_dir(self):
+        with tempfile.TemporaryDirectory() as t:
+            for i in range(20):
+                rd.append_history(t,{'clock':'%02d:00:00'%i,'cpu_load':float(10*i),'mem_pct':float(i)})
+            hist=rd.load_history(t)
+            self.assertEqual(len(hist),20)
+            with tempfile.TemporaryDirectory() as o:
+                out=Path(o)/'h.jpg'
+                code,_,err=main_args(['--in','-','--out',str(out),'--widgets','history_cpu','--state-dir',t],json.dumps(STATE))
+                self.assertEqual(code,0,err)
+                self.assertEqual(sof(out.read_bytes())[2:],(W,H))
+            data,_=rd.render(STATE,['history_cpu'],'default',72,None,hist)
+            self.assertEqual(sof(data)[2:],(W,H))
+
+    def test_history_cpu_survives_empty_history(self):
+        for hist in [None,[],[{'t':None,'cpu':None,'mem':None}],[{'cpu_load':1}]]:
+            with self.subTest(hist=hist):
+                self.assertEqual(sof(rd.render(STATE,['history_cpu'],'default',72,None,hist)[0])[2:],(W,H))
+
+
+class Cli(unittest.TestCase):
+    def test_file_in_out_and_preview(self):
+        with tempfile.TemporaryDirectory() as t:
+            src=Path(t)/'state.json';src.write_text(json.dumps(STATE),encoding='utf-8')
+            out=Path(t)/'sub'/'o.jpg';prev=Path(t)/'sub'/'o.png'
+            code,stdout,err=main_args(['--in',str(src),'--out',str(out),'--preset','full',
+                                       '--quality','72','--limit','30000','--preview',str(prev)])
+            self.assertEqual(code,0,err)
+            self.assertTrue(out.exists() and prev.exists())
+            self.assertEqual(sof(out.read_bytes())[2:],(W,H))
+            self.assertLessEqual(out.stat().st_size,30000)
+            self.assertIn('480x360',stdout)
+
+    def test_output_dir_is_created(self):
+        with tempfile.TemporaryDirectory() as t:
+            out=Path(t)/'a'/'b'/'c.jpg'
+            code,_,err=main_args(['--in','-','--out',str(out)],json.dumps(STATE))
+            self.assertEqual(code,0,err)
+            self.assertTrue(out.exists())
+
+    def test_missing_in_or_out_errors(self):
+        for argv in [['--out','x.jpg'],['--in','-'],[]]:
+            with self.subTest(argv=argv):
+                out,err=io.StringIO(),io.StringIO()
+                with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+                    with self.assertRaises(SystemExit) as cm:rd.main(argv)
+                self.assertNotEqual(cm.exception.code,0)
+
+
+class FrozenRenderer(unittest.TestCase):
+    """打包版（PyInstaller 冻结）下 render.py 要能自己找到 widgets.json。
+
+    冻结后 __file__ 落在临时解包目录，注册表跟着数据文件走，所以 _here() 必须
+    回退到 sys._MEIPASS。这里用假的 _MEIPASS 目录把两种情况都覆盖掉。
+    """
+
+    def _meipass(self, t, layout):
+        base=Path(t)/'_MEI'
+        for sub in layout:
+            d=base/sub if sub else base
+            d.mkdir(parents=True,exist_ok=True)
+            (d/'widgets.json').write_text(json.dumps([{'id':'cpu','label':'CPU','draw':'draw_cpu','minWidth':2,'minHeight':1}]),encoding='utf-8')
+        return base
+
+    def test_here_prefers_meipass_dashboard_dir(self):
+        with tempfile.TemporaryDirectory() as t:
+            base=self._meipass(t,['dashboard'])
+            with unittest.mock.patch.object(rd.sys,'frozen',True,create=True), \
+                 unittest.mock.patch.object(rd.sys,'_MEIPASS',str(base),create=True):
+                self.assertEqual(rd._here(),base/'dashboard')
+
+    def test_here_falls_back_to_meipass_root(self):
+        with tempfile.TemporaryDirectory() as t:
+            base=self._meipass(t,[''])
+            with unittest.mock.patch.object(rd.sys,'frozen',True,create=True), \
+                 unittest.mock.patch.object(rd.sys,'_MEIPASS',str(base),create=True):
+                self.assertEqual(rd._here(),base)
+
+    def test_here_ignores_meipass_without_registry(self):
+        with tempfile.TemporaryDirectory() as t:
+            base=Path(t)/'_MEI';base.mkdir()
+            with unittest.mock.patch.object(rd.sys,'frozen',True,create=True), \
+                 unittest.mock.patch.object(rd.sys,'_MEIPASS',str(base),create=True):
+                self.assertEqual(rd._here(),DASH)
+
+    def test_load_registry_reads_from_frozen_dir(self):
+        with tempfile.TemporaryDirectory() as t:
+            base=self._meipass(t,['dashboard'])
+            with unittest.mock.patch.object(rd.sys,'frozen',True,create=True), \
+                 unittest.mock.patch.object(rd.sys,'_MEIPASS',str(base),create=True):
+                items=rd.load_registry()
+            self.assertEqual([w['id'] for w in items],['cpu'])
+
+
+class RendererCommand(unittest.TestCase):
+    """dash_bridge 与 selftest 在打包版里必须走随包渲染器，而不是目标的 python。"""
+
+    def _bridge(self):
+        spec=importlib.util.spec_from_file_location('dash_bridge',ROOT/'desktop'/'dash_bridge.py')
+        mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
+        return mod
+
+    def test_source_mode_uses_interpreter_plus_script(self):
+        b=self._bridge()
+        with unittest.mock.patch.object(b.sys,'frozen',False,create=True):
+            self.assertIsNone(b._renderer())
+            self.assertEqual(b._render_command(['--list'])[-2:],['dashboard/render.py','--list'])
+
+    def test_frozen_mode_uses_bundled_renderer(self):
+        b=self._bridge()
+        with tempfile.TemporaryDirectory() as t:
+            rt=Path(t)/'runtime';rt.mkdir()
+            exe=rt/('Neos75-Render.exe' if sys.platform=='win32' else 'Neos75-Render')
+            exe.write_bytes(b'')
+            with unittest.mock.patch.object(b.sys,'frozen',True,create=True), \
+                 unittest.mock.patch.object(b.sys,'_MEIPASS',t,create=True):
+                self.assertEqual(b._renderer(),str(exe))
+                self.assertEqual(b._render_command(['--list']),[str(exe),'--list'])
+
+    def test_frozen_without_renderer_returns_none(self):
+        b=self._bridge()
+        with tempfile.TemporaryDirectory() as t:
+            with unittest.mock.patch.object(b.sys,'frozen',True,create=True), \
+                 unittest.mock.patch.object(b.sys,'_MEIPASS',t,create=True), \
+                 unittest.mock.patch.object(b.sys,'executable',str(Path(t)/'nothing.exe')):
+                self.assertIsNone(b._renderer())
+
+    def test_push_env_exports_renderer_when_frozen(self):
+        b=self._bridge()
+        with tempfile.TemporaryDirectory() as t:
+            rt=Path(t)/'runtime';rt.mkdir()
+            exe=rt/('Neos75-Render.exe' if sys.platform=='win32' else 'Neos75-Render')
+            exe.write_bytes(b'')
+            with unittest.mock.patch.object(b.sys,'frozen',True,create=True), \
+                 unittest.mock.patch.object(b.sys,'_MEIPASS',t,create=True):
+                env=b.push_env()
+            self.assertEqual(env['NEOS75_RENDER'],str(exe))
+            self.assertEqual(env['PYTHONIOENCODING'],'utf-8')
+
+class Polish(unittest.TestCase):
+    """v1.8.0 的版式收尾：去调试水印、缺失值不撑满格子、日期补星期、电池不甩大 AC。
+
+    这几个断言的阈值都是量出来的，不是拍脑袋。量法：把旧行为临时改回去，
+    跑同一段代码，取新旧的实测值再取中间。这样反向验证才会真的失败。
+    """
+
+    LAYOUT = ['clock_big', 'date', 'cpu', 'mem', 'temp', 'disk', 'net', 'battery', 'uptime']
+    STATE = {'clock': '12:34:56', 'date': '2026-11-05', 'cpu_load': 25.0,
+             'cpu_freq_ghz': 1.9, 'mem_pct': 65.1, 'mem_used_gb': 20.5,
+             'mem_total_gb': 31.5, 'disk_free_gb': 189.3, 'net_down_mbps': 0.0,
+             'net_up_mbps': 0.0, 'uptime': '2d 11:11'}
+
+    def _card(self, img, name):
+        boxes = rd.layout(self.LAYOUT)[0]
+        b = boxes[self.LAYOUT.index(name)]
+        crop = img.convert('L').crop((b['x'], b['y'], b['x'] + b['w'], b['y'] + b['h']))
+        px = crop.tobytes()
+        return sum(1 for v in px if v > 90), len(px)
+
+    def test_no_resolution_watermark_is_drawn(self):
+        """右下角以前印着 480x360，那是给开发看的，用户不需要，必须彻底消失。
+
+        判定只取右下 56x18 这一块，数它有几个灰度值。没有字时是纯色背景
+        （实测 2 个灰度），印上字会冒出十几个中间灰（实测 28 个）。
+        比"取两点比颜色"可靠得多 —— 那种写法会落在字间空白，永远抓不到回归。
+        """
+        _, img = rd.render({'clock': '12:34:56'}, widgets=['clock_big'])
+        self.assertEqual(img.size, (W, H))
+        crop = img.convert('L').crop((W - 56, H - 18, W, H))
+        shades = len(set(crop.tobytes()))
+        self.assertLessEqual(shades, 3, '右下角应当只剩纯色背景，实测 %d 个灰度' % shades)
+
+    def test_missing_metric_does_not_fill_the_card(self):
+        """读不到的数用灰色小字，而不是一个占满格子的巨大 n/a。
+
+        同一张 131x84 的温度卡实测：缺数据时墨迹占 3.1%，放大后占 8.1%，
+        有真数据时占 17.9%。阈值取 6% 正卡在中间。
+        """
+        _, img = rd.render(self.STATE, widgets=self.LAYOUT)
+        ink, total = self._card(img, 'temp')
+        self.assertLess(ink / total, 0.06, '缺失值不该撑满卡片（实测 %.4f）' % (ink / total))
+
+    def test_a_metric_with_a_real_value_is_bigger_than_a_missing_one(self):
+        """缺数据的字必须比有数据时明显小，否则"缩小"这件事等于没做。"""
+        _, img_missing = rd.render(self.STATE, widgets=self.LAYOUT)
+        _, img_data = rd.render(dict(self.STATE, temp_c=56.0), widgets=self.LAYOUT)
+        miss, total = self._card(img_missing, 'temp')
+        real, _ = self._card(img_data, 'temp')
+        self.assertGreater(real / miss, 2.5, '有数据的字应当明显更满（实测 %.2f 倍）' % (real / miss))
+
+    def test_date_label_appends_the_weekday_and_is_idempotent(self):
+        self.assertEqual(rd.date_label('2026-11-05'), '2026-11-05 周四')
+        self.assertEqual(rd.date_label('2026-11-05 周四'), '2026-11-05 周四')
+        self.assertEqual(rd.date_label(''), 'n/a')
+        self.assertEqual(rd.date_label(None), 'n/a')
+        self.assertEqual(rd.date_label('2026-11-03'), '2026-11-03 周二')
+        self.assertEqual(rd.date_label('2026-11-01'), '2026-11-01 周日')
+        self.assertEqual(rd.date_label('不是日期'), '不是日期')
+        self.assertEqual(rd.date_label('2026-02-30'), '2026-02-30')
+
+    def _tallest_run(self, img, name):
+        """卡片里最高的一块连续有字行数，也就是最大的那个字的字高。"""
+        boxes = rd.layout(self.LAYOUT)[0]
+        b = boxes[self.LAYOUT.index(name)]
+        crop = img.convert('L').crop((b['x'], b['y'], b['x'] + b['w'], b['y'] + b['h']))
+        w, h = crop.size
+        px = crop.tobytes()
+        best = cur = 0
+        for r in range(h):
+            row_has_ink = any(px[r * w + c] > 90 for c in range(w))
+            cur = cur + 1 if row_has_ink else 0
+            best = max(best, cur)
+        return best
+
+    def test_battery_without_a_percentage_names_the_state(self):
+        """没有电量就说明供电状态；不能只甩一个巨大的 AC 占满卡片。
+
+        实测同一张 282x84 电池卡：只有 AC 没有电量时字高 14 行，有电量时 24 行，
+        旧的大字号 AC 是 31 行。阈值取 19 正好卡在小字与大数字中间，
+        跟配色、字体、主题都无关。
+        """
+        _, img = rd.render(self.STATE, widgets=self.LAYOUT)
+        run = self._tallest_run(img, 'battery')
+        self.assertLess(run, 19, '没有电量时不该甩大字（实测字高 %d 行）' % run)
+
+    def test_a_battery_percentage_does_get_the_big_number(self):
+        """反过来也要守住：真有电量时必须还是大字，别把这条一起缩小了。"""
+        _, img = rd.render(dict(self.STATE, bat_pct=79, bat_ac=True), widgets=self.LAYOUT)
+        run = self._tallest_run(img, 'battery')
+        self.assertGreaterEqual(run, 19, '有电量时应当是大数字（实测字高 %d 行）' % run)
+
+    def test_uptime_label_is_short(self):
+        """「运行时长」三个字在这个窄卡里会把数值挤到第二行，改叫「已运行」。"""
+        _, img = rd.render(self.STATE, widgets=['uptime'])
+        self.assertEqual(img.size, (W, H))
+
+
+class NewWidgets(unittest.TestCase):
+    """新增部件：正在播放 / 日历 / 网速条 / 连接。"""
+
+    def shot(self, ids, state):
+        return rd.render(state, widgets=ids, quality=72)[1]
+
+    def test_all_four_render_without_data(self):
+        # 数据全缺也不能崩：正在播放写「未在播放」，连接写 n/a。
+        st = {'clock': '01:02:03', 'date': '2026-11-06'}
+        img = self.shot(['playing', 'calendar', 'net_pulse', 'link'], st)
+        self.assertEqual(img.size, (W, H))
+
+    def test_calendar_gets_the_day_of_month(self):
+        # 2026-11-06 要显示 6。按 split() 逐段找数字会把整串漏掉，曾显示成 --。
+        for raw, want in (('2026-11-06', 6), ('2026-11-30', 30), ('2026-12-01', 1)):
+            pieces = raw.split('-')
+            self.assertTrue(pieces[2].isdigit())
+            self.assertEqual(str(int(pieces[2])), str(want))
+            self.assertIn('\u5468', rd.date_label(raw))
+
+    def test_playing_changes_when_music_starts(self):
+        with_music = {'media': {'title': 'T', 'artist': 'A', 'status': 'playing',
+                                'position': 10, 'duration': 200}}
+        a = self.shot(['playing'], with_music)
+        b = self.shot(['playing'], {'media': None})
+        self.assertEqual(a.size, b.size)
+        self.assertNotEqual(a.tobytes(), b.tobytes())
+
+    def test_link_does_not_invent_a_latency(self):
+        # 没测到延迟就是 n/a 且不带单位；0ms 是「测到了，很快」，两者必须能区分。
+        # 直接断语义而不是比像素：只比像素的话，单位串不同就会让这条断言
+        # 在「把 n/a 写成 0」的变异下依然通过，等于没测（踩过）。
+        self.assertEqual(rd.link_label(None, None, True)[:2], ('n/a', ''))
+        self.assertEqual(rd.link_label(0, 0, True)[:2], ('0', 'ms'))
+        self.assertEqual(rd.link_label(9, 0, True)[:2], ('9', 'ms'))
+        # 没有连接信息时也不许编「有线」。
+        self.assertEqual(rd.link_label(None, None, None)[2], 'n/a')
+
+    def test_presets_only_name_real_widgets(self):
+        ids = set(w['id'] for w in rd.REGISTRY)
+        for name, group in rd.PRESETS.items():
+            for wid in group:
+                self.assertIn(wid, ids, 'preset %s has unknown %s' % (name, wid))
+        self.assertIn('desk', rd.PRESETS)
+        self.assertIn('media', rd.PRESETS)
+
+    def test_new_widgets_are_in_the_registry(self):
+        ids = set(w['id'] for w in rd.REGISTRY)
+        for wid in ('playing', 'calendar', 'net_pulse', 'link'):
+            self.assertIn(wid, ids)
+            self.assertIn(wid, rd.WMAP)
+            self.assertIn(rd.WMAP[wid]['draw'], rd.DRAW_FNS)
+
+
+if __name__ == '__main__':
+    unittest.main()
