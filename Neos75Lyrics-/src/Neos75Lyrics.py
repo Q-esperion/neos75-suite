@@ -1409,6 +1409,29 @@ class App:
         else:
             messagebox.showwarning("推送到屏幕", msg)
 
+    def brightness_step(self, up):
+        """外观页「亮度 +/−」：走官方 SCREEN_CONTROL 命令调键盘小屏背光。"""
+        def work():
+            if self.engine and self.engine.running:
+                ok, msg = self.engine.screen_brightness(up)
+            else:
+                # 引擎没在跑：设备空闲，直接开一次通道发送
+                try:
+                    import screen_hid
+                    s = screen_hid.Screen().open()
+                    try:
+                        acked = s.control(
+                            screen_hid.CTL_BRIGHT_UP if up else screen_hid.CTL_BRIGHT_DOWN)
+                    finally:
+                        s.close()
+                    ok = True
+                    verb = "已调亮一档" if up else "已调暗一档"
+                    msg = verb if acked else verb + "（未收到应答）"
+                except Exception as exc:
+                    ok, msg = False, f"未找到键盘屏幕：{exc}"
+            self.events.put(("bright", (ok, msg)))
+        threading.Thread(target=work, daemon=True).start()
+
     def push_game(self):
         if not self.engine or not self.engine.running:
             messagebox.showinfo("推送", "先点「开始 / 停止」开始同步。")
@@ -1484,6 +1507,20 @@ class App:
         self.idle_label = tk.Label(r3, text=self._idle_name(), bg=CARD, fg=DIM, font=(FONT, 8))
         self.idle_label.pack(side="left")
         tk.Label(idle_card.body, text="GIF 会按约 1 秒一帧循环播放（受屏幕传输速度限制）",
+                 bg=CARD, fg=DIM, font=(FONT, 8), anchor="w").pack(fill="x", pady=(8, 0))
+
+        bright_card = Card(frame, bg=CARD, radius=16, padx=18, pady=14)
+        bright_card.pack(fill="x", pady=(0, 12))
+        r4 = tk.Frame(bright_card.body, bg=CARD)
+        r4.pack(fill="x")
+        pill(r4, "亮度 +", lambda: self.brightness_step(True), "ghost", width=7,
+             size=9).pack(side="right")
+        pill(r4, "亮度 −", lambda: self.brightness_step(False), "ghost", width=7,
+             size=9).pack(side="right", padx=(0, 8))
+        tk.Label(r4, text="屏幕亮度", bg=CARD, fg=FG, font=(FONT, 10)).pack(side="left")
+        self.bright_label = tk.Label(r4, text="", bg=CARD, fg=MUTED, font=(FONT, 8))
+        self.bright_label.pack(side="left", padx=10)
+        tk.Label(bright_card.body, text="调节键盘小屏背光（和官方驱动「亮度+/−」同一命令），等级存在键盘里",
                  bg=CARD, fg=DIM, font=(FONT, 8), anchor="w").pack(fill="x", pady=(8, 0))
 
         opt_card = Card(frame, bg=CARD, radius=16, padx=18, pady=12)
@@ -1980,9 +2017,15 @@ class App:
             key, path = self._run_key()
             with winreg.OpenKey(key, path, 0, winreg.KEY_SET_VALUE) as k:
                 if self.autostart_var.get():
-                    cmd = f'"{sys.executable}" --tray'
+                    exe = sys.executable
                     if not getattr(sys, "frozen", False):
-                        cmd = f'"{sys.executable}" "{os.path.abspath(__file__)}" --tray'
+                        # pythonw.exe = same interpreter, runs without a console window
+                        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+                        if os.path.exists(pythonw):
+                            exe = pythonw
+                        cmd = f'"{exe}" "{os.path.abspath(__file__)}" --tray'
+                    else:
+                        cmd = f'"{exe}" --tray'
                     winreg.SetValueEx(k, "Neos75Lyrics", 0, winreg.REG_SZ, cmd)
                     self._clear_startup_approved()
                 else:
@@ -2060,6 +2103,10 @@ class App:
                     self._update_game(payload[0], payload[1])
                 elif kind == "knob":
                     self.status_label.config(text="屏幕旋钮已按下：先点侧栏「开始」再锁定页面", fg=MUTED)
+                elif kind == "bright":
+                    ok, msg = payload
+                    if hasattr(self, "bright_label"):
+                        self.bright_label.config(text=msg, fg=MINT if ok else DANGER)
                 elif kind == "error":
                     self.status_label.config(text=payload, fg=DANGER)
         except queue.Empty:

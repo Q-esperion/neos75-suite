@@ -16,6 +16,14 @@ USAGE = 0x61
 BLOCK = 4096
 CHUNK = 62
 
+# SCREEN_CONTROL (0x39) one-byte actions, from the official AULA Hub driver
+# (hub.aulacn.com YbScreenDevices): flip down 0x01 / up 0x02,
+# screen backlight bright 0xA1 / dark 0xA2
+CTL_NEXT = 0x01
+CTL_PREV = 0x02
+CTL_BRIGHT_UP = 0xA1
+CTL_BRIGHT_DOWN = 0xA2
+
 
 class ScreenError(RuntimeError):
     pass
@@ -163,6 +171,29 @@ class Screen:
             "support_jpg": info[10] == 1,
             "space": space,
         }
+
+    def control(self, sub, timeout=1.0):
+        """Send a SCREEN_CONTROL (0x39) command, e.g. CTL_BRIGHT_UP/CTL_BRIGHT_DOWN.
+
+        Same framing as the reference flip tool: body [0x39, 0, len+1, 0, sub],
+        wrapped as 0xA5 ... chk where chk = sum(body) ^ 0xFF. Returns True when
+        the screen acknowledged, False on silence (command may still have run).
+        """
+        body = bytes([0x39, 0, 2, 0, sub])
+        chk = (sum(body) ^ 0xFF) & 0xFF
+        self.dev.write(bytes([0, 0xA5]) + body + bytes([chk]) + bytes(58))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            data = bytes(self.dev.read(64, 200))
+            if len(data) >= 6 and data[0] == 0xA5 and data[1] == 0x39:
+                n = data[3]
+                if n < 1 or 4 + n >= len(data):
+                    raise ScreenError("control ack truncated")
+                calc = (sum(data[1:4 + n]) ^ 0xFF) & 0xFF
+                if calc != data[4 + n]:
+                    raise ScreenError("control ack checksum mismatch")
+                return True
+        return False
 
 
     # ------------------------------------------------------------- dfu

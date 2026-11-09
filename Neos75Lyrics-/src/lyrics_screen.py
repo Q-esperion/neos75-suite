@@ -973,6 +973,22 @@ class Engine:
                 return
         self._show_idle_or_info()
 
+    def screen_brightness(self, up=True):
+        """Step the keyboard screen backlight (official SCREEN_CONTROL 0xA1/0xA2)."""
+        if self.screen is None:
+            ok, msg = self.check_device()
+            if not ok:
+                return False, msg
+        sub = screen_hid.CTL_BRIGHT_UP if up else screen_hid.CTL_BRIGHT_DOWN
+        try:
+            acked = self._ensure_screen().control(sub)
+        except Exception as exc:
+            dbg(f"brightness failed: {exc}")
+            self._drop_screen()
+            return False, f"调节失败：{exc}"
+        verb = "已调亮一档" if up else "已调暗一档"
+        return True, verb if acked else verb + "（未收到应答）"
+
     def push_module(self, key):
         """Render one module page and push it right away (UI 推送到屏幕 buttons)."""
         mapping = {
